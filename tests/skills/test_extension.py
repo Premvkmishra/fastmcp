@@ -173,6 +173,29 @@ async def test_list_skills_enforces_page_limit() -> None:
             await client.list_skills(max_pages=1)
 
 
+class EmptyCursorSkillsExtension(SkillsExtension):
+    """Serves two pages whose continuation cursor is the empty string."""
+
+    async def _handle_list(
+        self,
+        context: ServerRequestContext[Any, Any],
+        params: ListSkillsParams,
+    ) -> ListSkillsResult:
+        if params.cursor is None:
+            return ListSkillsResult(skills=[make_skill("alpha")], next_cursor="")
+        return ListSkillsResult(skills=[make_skill("beta")])
+
+
+async def test_list_skills_follows_empty_cursor() -> None:
+    server = FastMCP("skills")
+    server.add_extension(EmptyCursorSkillsExtension())
+
+    async with skills_client(server) as client:
+        all_skills = await client.list_skills()
+
+    assert [skill.frontmatter.name for skill in all_skills] == ["alpha", "beta"]
+
+
 async def test_get_skill_is_authoritative_for_unlisted_skill() -> None:
     hidden_from_list = make_skill("direct-only")
     provider = MemorySkillProvider(listed=[], addressable=[hidden_from_list])
@@ -272,10 +295,9 @@ async def test_get_unknown_skill_returns_invalid_params() -> None:
     assert exc_info.value.error.code == INVALID_PARAMS
 
 
-@pytest.mark.parametrize("page_size", [None, 1])
-async def test_list_rejects_invalid_cursor(page_size: int | None) -> None:
+async def test_list_rejects_invalid_cursor() -> None:
     server = make_server(
-        MemorySkillProvider(listed=[make_skill("review")]), page_size=page_size
+        MemorySkillProvider(listed=[make_skill("review")]), page_size=1
     )
 
     async with skills_client(server) as client:

@@ -34,7 +34,12 @@ from fastmcp.resources.base import (
 )
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
-from fastmcp.tools.base import InputRequiredToolResult, Tool, ToolResult
+from fastmcp.tools.base import (
+    InputRequiredToolResult,
+    RawStructuredToolResult,
+    Tool,
+    ToolResult,
+)
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import CacheScope, FastMCPBaseModel
 
@@ -145,9 +150,10 @@ class CacheableResourceResult(FastMCPBaseModel):
 
 class CacheableToolResult(FastMCPBaseModel):
     content: list[mcp_types.ContentBlock]
-    structured_content: dict[str, Any] | None
+    structured_content: Any
     meta: dict[str, Any] | None
     is_error: bool = False
+    raw_structured_content: bool = False
 
     @classmethod
     def wrap(cls, value: ToolResult) -> Self:
@@ -156,15 +162,20 @@ class CacheableToolResult(FastMCPBaseModel):
             structured_content=value.structured_content,
             meta=value.meta,
             is_error=value.is_error,
+            raw_structured_content=isinstance(value, RawStructuredToolResult),
         )
 
     def unwrap(self) -> ToolResult:
-        return ToolResult(
+        result_type = (
+            RawStructuredToolResult if self.raw_structured_content else ToolResult
+        )
+        result = result_type(
             content=self.content,
             structured_content=self.structured_content,
             meta=self.meta,
             is_error=self.is_error,
         )
+        return result
 
 
 class CacheableMessage(FastMCPBaseModel):
@@ -175,6 +186,7 @@ class CacheableMessage(FastMCPBaseModel):
         mcp_types.TextContent
         | mcp_types.ImageContent
         | mcp_types.AudioContent
+        | mcp_types.ResourceLink
         | mcp_types.EmbeddedResource
     )
 
@@ -254,8 +266,7 @@ class ResponseCachingStatistics(FastMCPBaseModel):
 
 
 class ResponseCachingMiddleware(Middleware):
-    """The response caching middleware offers a simple way to cache responses to mcp methods. The Middleware
-    supports cache invalidation via notifications from the server. The Middleware implements TTL-based caching
+    """The response caching middleware offers a simple way to cache responses to mcp methods. The Middleware implements TTL-based caching
     but cache implementations may offer additional features like LRU eviction, size limits, and more.
 
     When items are retrieved from the cache they will no longer be the original objects, but rather no-op objects
@@ -370,7 +381,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.ListToolsRequest, Sequence[Tool]],
     ) -> Sequence[Tool]:
         """List tools from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         if self._list_tools_settings.get("enabled") is False:
             return await call_next(context)
 
@@ -403,7 +414,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.ListResourcesRequest, Sequence[Resource]],
     ) -> Sequence[Resource]:
         """List resources from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         if self._list_resources_settings.get("enabled") is False:
             return await call_next(context)
 
@@ -436,7 +447,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.ListPromptsRequest, Sequence[Prompt]],
     ) -> Sequence[Prompt]:
         """List prompts from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         if self._list_prompts_settings.get("enabled") is False:
             return await call_next(context)
 
@@ -467,7 +478,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.CallToolRequestParams, ToolResult],
     ) -> ToolResult:
         """Call a tool from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         tool_name = context.message.name
 
         if self._call_tool_settings.get(
@@ -479,7 +490,12 @@ class ResponseCachingMiddleware(Middleware):
             return await call_next(context)
 
         cache_key: str = _make_call_tool_cache_key(
-            msg=context.message, auth_key=_get_auth_partition_key()
+            msg=context.message,
+            auth_key=_get_auth_partition_key(),
+            modern_protocol=(
+                context.fastmcp_context is not None
+                and context.fastmcp_context._is_modern_protocol()
+            ),
         )
 
         if cached_value := await self._call_tool_cache.get(key=cache_key):
@@ -531,7 +547,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.ReadResourceRequestParams, ResourceResult],
     ) -> ResourceResult:
         """Read a resource from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         if self._read_resource_settings.get("enabled") is False:
             return await call_next(context)
 
@@ -580,7 +596,7 @@ class ResponseCachingMiddleware(Middleware):
         call_next: CallNext[mcp_types.GetPromptRequestParams, PromptResult],
     ) -> PromptResult:
         """Get a prompt from the cache, if caching is enabled, and the result is in the cache. Otherwise,
-        otherwise call the next middleware and store the result in the cache if caching is enabled."""
+        call the next middleware and store the result in the cache if caching is enabled."""
         if self._get_prompt_settings.get("enabled") is False:
             return await call_next(context)
 
@@ -697,12 +713,14 @@ def _get_component_version_cache_key(msg: mcp_types.RequestParams) -> str:
 
 
 def _make_call_tool_cache_key(
-    msg: mcp_types.CallToolRequestParams, auth_key: str = ANONYMOUS_AUTH_KEY
+    msg: mcp_types.CallToolRequestParams,
+    auth_key: str = ANONYMOUS_AUTH_KEY,
+    modern_protocol: bool = False,
 ) -> str:
-    """Make a cache key for a tool call using name, version, and arguments."""
+    """Make a cache key for a tool call using protocol era, name, version, and arguments."""
 
     return _hash_cache_key(
-        f"{auth_key}:{_get_component_version_cache_key(msg)}:{msg.name}:"
+        f"{auth_key}:{modern_protocol}:{_get_component_version_cache_key(msg)}:{msg.name}:"
         f"{_get_arguments_str(msg.arguments)}"
     )
 
